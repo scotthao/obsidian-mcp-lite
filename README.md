@@ -103,3 +103,7 @@ On Windows, use `"command": "python"` and a Windows-style path.
 ## License
 
 MIT
+
+## Credits
+
+Written by Claude (Anthropic) in collaboration with Scott Hao, who designed the requirements, tested it against a real vault, and maintains it.
