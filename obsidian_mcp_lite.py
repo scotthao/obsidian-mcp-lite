@@ -15,7 +15,7 @@ Config (env vars, same names the stock connector uses):
     OBSIDIAN_HOST      default 127.0.0.1
     OBSIDIAN_PORT      default 27124
     OBSIDIAN_PROTOCOL  default https
-    OBSIDIAN_LAUNCH_CMD default: platform-appropriate launch command
+    OBSIDIAN_LAUNCH_CMD default "open -a Obsidian"  (test hook)
 
 Requires only Python 3.8+ standard library.
 """
@@ -25,13 +25,14 @@ import os
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 SERVER_NAME = "obsidian-mcp-lite"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 API_KEY = os.environ.get("OBSIDIAN_API_KEY", "")
 HOST = os.environ.get("OBSIDIAN_HOST", "127.0.0.1")
@@ -115,7 +116,8 @@ def call_api(method, path, body=None, headers=None, query=None):
     try:
         return _request(method, path, body, headers, query)
     except ServerDown:
-        ensure_up()
+        with _heal_lock:
+            ensure_up()
         return _request(method, path, body, headers, query)
 
 
@@ -247,7 +249,7 @@ TOOLS = {
     },
     "write_note": {
         "fn": tool_write_note,
-        "description": "Create or overwrite a note with the given markdown content.",
+        "description": "Create or overwrite a note, REPLACING its entire contents. Caution: if other chats or apps may also be updating this note, use append_note instead - a full rewrite silently discards concurrent changes made after you read the note.",
         "schema": {
             "type": "object",
             "properties": {
@@ -259,7 +261,7 @@ TOOLS = {
     },
     "append_note": {
         "fn": tool_append_note,
-        "description": "Append content to the end of a note (creates it if missing).",
+        "description": "Append content to the end of a note (creates it if missing). Safe under concurrency: preferred over write_note for logs, trackers, dashboards, and any note that multiple chats or scheduled tasks update.",
         "schema": {
             "type": "object",
             "properties": {
@@ -291,9 +293,14 @@ TOOLS = {
 
 # ---------------- JSON-RPC / MCP plumbing ----------------
 
+_stdout_lock = threading.Lock()
+_heal_lock = threading.Lock()
+
+
 def send(msg):
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+    with _stdout_lock:
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
 
 
 def reply(req_id, result):
@@ -324,27 +331,33 @@ def handle(msg):
             for name, t in TOOLS.items()
         ]})
     elif method == "tools/call":
-        params = msg.get("params") or {}
-        name = params.get("name")
-        tool = TOOLS.get(name)
-        if not tool:
-            reply_error(req_id, -32602, f"Unknown tool: {name}")
-            return
-        if not API_KEY:
-            reply(req_id, {"content": [{"type": "text", "text":
-                "OBSIDIAN_API_KEY is not set in the connector config. Copy the key "
-                "from Obsidian Settings -> Local REST API into the config env."}],
-                "isError": True})
-            return
-        try:
-            text = tool["fn"](params.get("arguments") or {})
-            reply(req_id, {"content": [{"type": "text", "text": text}]})
-        except Exception as e:
-            reply(req_id, {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True})
+        threading.Thread(target=_handle_tool_call, args=(msg,)).start()
     elif is_notification:
         pass
     else:
         reply_error(req_id, -32601, f"Method not found: {method}")
+
+
+def _handle_tool_call(msg):
+    """Runs in its own thread so one slow request never blocks others."""
+    req_id = msg.get("id")
+    params = msg.get("params") or {}
+    name = params.get("name")
+    tool = TOOLS.get(name)
+    if not tool:
+        reply_error(req_id, -32602, f"Unknown tool: {name}")
+        return
+    if not API_KEY:
+        reply(req_id, {"content": [{"type": "text", "text":
+            "OBSIDIAN_API_KEY is not set in the connector config. Copy the key "
+            "from Obsidian Settings -> Local REST API into the config env."}],
+            "isError": True})
+        return
+    try:
+        text = tool["fn"](params.get("arguments") or {})
+        reply(req_id, {"content": [{"type": "text", "text": text}]})
+    except Exception as e:
+        reply(req_id, {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True})
 
 
 def main():
